@@ -11,7 +11,7 @@ or reproducing the tested configuration.
 | Package | Tested version |
 |---|---|
 | Python | 3.10 |
-| TensorFlow | 2.18 |
+| TensorFlow | 2.18 (also tested: 2.21 CPU, 2.16.1 + tensorflow-metal) |
 | NumPy | 2.0 |
 | SciPy | ≥ 1.10 |
 | Matplotlib | ≥ 3.7 |
@@ -43,9 +43,53 @@ conda install scikit-learn
 
 > **GPU note**: if you have a CUDA-capable GPU, replace the pip line with
 > `pip install tensorflow[and-cuda]==2.18` and make sure your CUDA and cuDNN
-> versions match TensorFlow's requirements. For CPU-only use (which is fine for
-> small networks, N ≤ 60), the plain `tensorflow` package works without any
-> CUDA setup.
+> versions match TensorFlow's requirements. For CPU-only use, the plain
+> `tensorflow` package works without any CUDA setup.
+>
+> On **Apple Silicon**, see the next section — a GPU only helps if you use the
+> batched simulation package, and it is dramatically *slower* otherwise.
+
+---
+
+## Apple Silicon: the two environments on this machine
+
+| env | TensorFlow | devices | use for |
+|---|---|---|---|
+| `ampl_tf` | 2.21.0 | CPU only | the trusted `tools_2D/simulate` path |
+| `tf_metal` | 2.16.1 + `tensorflow-metal` | CPU + GPU | the batched `tools_2D/simulate_batched` path |
+
+```bash
+~/anaconda3/envs/ampl_tf/bin/python  Example_Networks/run_spont_network_structInputs.py
+~/anaconda3/envs/tf_metal/bin/python Example_Networks/run_spont_network_structInputs_batched.py
+```
+
+To create a Metal environment from scratch:
+
+```bash
+conda create -n tf_metal python=3.10
+conda activate tf_metal
+pip install tensorflow==2.16.1 tensorflow-metal
+conda install numpy scipy matplotlib h5py tqdm scikit-image scikit-learn
+```
+
+`tensorflow-metal` lags TensorFlow releases, so the Metal env is pinned to an
+older TensorFlow than the CPU env. Check Apple's compatibility table before
+bumping either version.
+
+**Read [PERFORMANCE.md](PERFORMANCE.md) before using the Metal environment.**
+Under the original `tf.scan` path, `tensorflow-metal` is roughly **100x slower**
+than CPU-only TensorFlow (305 s vs 3.3 s per simulation). It only pays off with
+the batched package, where it is the fastest option available (0.07 s per
+simulation). Note also that Apple GPUs have no fp64 support at all, and that
+`tensorflow-metal` has a track record of correctness bugs — validate results
+against the CPU path with `Example_Networks/check_batched_equivalence.py`.
+
+To force CPU execution inside the Metal env, before any other TensorFlow call:
+
+```python
+import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')
+```
 
 ---
 

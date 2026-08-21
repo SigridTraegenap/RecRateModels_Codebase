@@ -19,6 +19,26 @@ cd Example_Networks
 conda run -n tf_pyth python loop_reload_Amodes_250925.py
 ```
 
+### Two simulation packages
+
+`tools_2D/simulate` (trusted, `tf.scan`) and `tools_2D/simulate_batched`
+(batched, `tf.while_loop`) expose the same class name, constructor signature, and
+`res_Input_mat()` signature and return shape, so you switch with one import line:
+
+```python
+import tools_2D.simulate.brain_network_tf         as bn   # trusted
+import tools_2D.simulate_batched.brain_network_tf as bn   # batched
+```
+
+The batched package simulates all stimuli at once, which is **7.5x faster on CPU**
+and the only form in which an Apple GPU helps at all — under `tensorflow-metal`
+the trusted path is ~100x *slower* than CPU, while the batched path is the
+fastest option available. It supports `integrator='runge_kutta'` only and never
+materialises the full trajectory.
+
+**See [PERFORMANCE.md](PERFORMANCE.md)** for the measured numbers, why the
+original shape defeats a GPU, and how far the two paths' results diverge.
+
 ---
 
 ## Repository layout
@@ -26,12 +46,15 @@ conda run -n tf_pyth python loop_reload_Amodes_250925.py
 ```
 Example_Networks/
   run_spont_network_structInputs.py ← annotated example: connectivity + spont + evoked simulation
+  run_spont_network_structInputs_batched.py ← same, on the batched (fast) path
+  check_batched_equivalence.py      ← verifies the batched path against the trusted one
+  bench_paths.py                    ← times both paths (add --cpu to hide the GPU)
   load_results.py                   ← minimal script for loading and plotting saved HDF5 output
   MODIFICATIONS.md                  ← guide for changing nonlinearity, connectivity, inputs, etc.
   ENVIRONMENT_SETUP.md              ← conda environment setup and package requirements
 
 tools_2D/
-  simulate/
+  simulate/                 ← TRUSTED path: one stimulus at a time, tf.scan
     brain_network_tf.py     ← BrainNetwork class (TF integrator)
     integration_methods_tf.py ← forward_euler, runge_kutta, runge_kutta2
     bn_tools_tf.py          ← nonlinearity functions (rectification, sigmoid, …)
