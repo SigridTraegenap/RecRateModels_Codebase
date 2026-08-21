@@ -245,6 +245,83 @@ def runge_kutta_explicit_movie(inputs_movie,
     return trajectory.stack()
 
 
+def runge_kutta_explicit_movie_strided(inputs_movie,
+                                       w_rec,
+                                       start_activity,
+                                       delta_t,
+                                       tau,
+                                       nonlinearity,
+                                       steps_per_frame,
+                                       record_every,
+                                       n_steps):
+    """Batched RK4 with a time-varying input AND an independent recording grid.
+
+    The general case of runge_kutta_explicit_movie: the stimulus advances every
+    `steps_per_frame` steps while the state is recorded every `record_every`
+    steps, and the two need not divide one another. That combination is common
+    in practice -- e.g. a bar sweeping in 60 phase steps held 33 integration
+    steps each, with activity written out every 20 steps.
+
+    Because the two grids can straddle, this uses one flat loop with a tf.cond
+    on the write, rather than the nested loop of runge_kutta_explicit_movie.
+    The cond costs one extra dispatch per step against four (B x N) @ (N x N)
+    matmuls, so it is lost in the noise; the nested version is kept for the
+    frame-aligned case because it is simpler and already validated.
+
+    Parameters
+    ----------
+    inputs_movie : tensor, shape (n_frames, n_sims, num_neurons), frame-major.
+    steps_per_frame, record_every, n_steps : PYTHON ints.
+        n_steps must be divisible by record_every; the caller enforces this.
+        Frame index at step i is i // steps_per_frame, clamped to the last
+        frame, so n_steps may exceed n_frames * steps_per_frame.
+
+    Returns
+    -------
+    tensor, shape (n_steps // record_every, n_sims, num_neurons)
+        Element r is the state after (r+1) * record_every steps.
+    """
+    n_records = n_steps // record_every
+    n_frames = inputs_movie.shape[0]
+
+    def fprime(x, inp):
+        return (-x + nonlinearity(inp + tf.matmul(x, w_rec, transpose_b=True))) / tau
+
+    def body(i, x, traj):
+        frame = tf.minimum(i // steps_per_frame, n_frames - 1)
+        inp = tf.gather(inputs_movie, frame)
+        k1 = fprime(x, inp)
+        k2 = fprime(x + 0.5 * k1 * delta_t, inp)
+        k3 = fprime(x + 0.5 * k2 * delta_t, inp)
+        k4 = fprime(x + k3 * delta_t, inp)
+        # coefficients copied verbatim from the trusted implementation
+        x_new = x + delta_t * ((1./6.)*k1 + (1./3.)*k2 + (1./3.)*k3 + (1./6.)*k4)
+
+        step_done = i + 1
+        traj = tf.cond(
+            tf.equal(step_done % record_every, 0),
+            lambda: traj.write(step_done // record_every - 1, x_new),
+            lambda: traj,
+        )
+        return step_done, x_new, traj
+
+    trajectory = tf.TensorArray(
+        dtype=start_activity.dtype,
+        size=n_records,
+        dynamic_size=False,
+        clear_after_read=False,
+        element_shape=start_activity.shape,
+    )
+
+    _, _, trajectory = tf.while_loop(
+        cond=lambda i, x, traj: i < n_steps,
+        body=body,
+        loop_vars=(tf.constant(0), start_activity, trajectory),
+        maximum_iterations=n_steps,
+    )
+    return trajectory.stack()
+
+
 def _not_implemented(name):
     def _stub(*args, **kwargs):
         raise NotImplementedError(

@@ -47,6 +47,31 @@ from tqdm import tqdm
 from tools_2D.simulate import bn_tools_tf as bnt
 from . import integration_methods_tf as im
 
+# Fail fast and legibly on a half-reloaded package.
+#
+# Spyder and IPython keep modules in sys.modules between runs, and Spyder's User
+# Module Reloader does not reliably reload submodules -- so this file can be the
+# new version while integration_methods_tf is still the copy imported before an
+# edit. Without this check the symptom is an AttributeError raised from inside
+# autograph-generated code, which points nowhere useful.
+_REQUIRED = ('runge_kutta_explicit',
+             'runge_kutta_explicit_trajectory',
+             'runge_kutta_explicit_movie',
+             'runge_kutta_explicit_movie_strided')
+_missing = [_f for _f in _REQUIRED if not hasattr(im, _f)]
+if _missing:
+    raise ImportError(
+        "tools_2D.simulate_batched.integration_methods_tf is missing: {}\n"
+        "\n"
+        "This almost always means a STALE module is cached in a long-running "
+        "interpreter -- the source on disk is fine.\n"
+        "\n"
+        "  Fix: restart the kernel.\n"
+        "       Spyder:  Consoles -> Restart kernel   (Ctrl+.)\n"
+        "       IPython: exit and start a new session\n"
+        "\n"
+        "Module was loaded from:\n  {}".format(", ".join(_missing), im.__file__))
+
 print("numpy -V", np.__version__)
 print("tf -V", tf.__version__)
 
@@ -175,6 +200,23 @@ class BrainNetwork:
             )
 
         self._advance_movie = advance_movie
+
+        @tf.function
+        def advance_movie_strided(inputs_movie, start_activity, steps_per_frame,
+                                  record_every, n_steps):
+            return im.runge_kutta_explicit_movie_strided(
+                inputs_movie,
+                self.tf_w_rec,
+                start_activity,
+                self.tf_delta_t,
+                self.tf_tau,
+                self.tf_nonlinearity,
+                steps_per_frame,
+                record_every,
+                n_steps,
+            )
+
+        self._advance_movie_strided = advance_movie_strided
 
     def advance(self, inputs, start_activity, n_steps):
         """Integrate a batch forward by n_steps and return the final state.
@@ -373,7 +415,8 @@ class BrainNetwork:
 
     def res_Input_mat_movie(self, inputs_movie, steps_per_frame, start=None,
                             batch_size=None, out_dtype=np.float32,
-                            memory_budget_gb=2.0, verbose=True):
+                            memory_budget_gb=2.0, verbose=True,
+                            record_every=None, n_steps=None):
         """Simulate with a TIME-VARYING input, e.g. a moving stimulus.
 
         Frame f of the movie drives the network for `steps_per_frame`
@@ -400,8 +443,21 @@ class BrainNetwork:
             the stimulus barely moves within a frame.
         out_dtype : numpy dtype of the returned array (default float32).
 
-        returns: (n_sims, n_frames, num_neurons) -- state at the end of each
-                 frame. Take [:, -1, :] for the final state only.
+        record_every : int or None
+            None (default) records at the end of each frame, giving one record
+            per frame. Give an integer to record on an independent grid -- e.g.
+            a stimulus advancing every 33 steps while activity is written out
+            every 20. Must divide n_steps.
+        n_steps : int or None
+            Total integration steps. Defaults to n_frames * steps_per_frame.
+            Only meaningful together with record_every; if larger than the movie
+            covers, the last frame is held for the remainder.
+
+        returns: (n_sims, n_records, num_neurons).
+                 With record_every=None, n_records == n_frames and element f is
+                 the state at the end of frame f. Otherwise n_records ==
+                 n_steps // record_every and element r is the state after
+                 (r+1) * record_every steps. Take [:, -1, :] for the final state.
         """
         inputs_movie = np.asarray(inputs_movie)
         if inputs_movie.ndim != 3:
@@ -417,8 +473,31 @@ class BrainNetwork:
         if steps_per_frame < 1:
             raise ValueError("steps_per_frame must be >= 1")
 
+        strided = record_every is not None
+        if strided:
+            record_every = int(record_every)
+            if record_every < 1:
+                raise ValueError("record_every must be >= 1")
+            n_steps = int(n_steps) if n_steps is not None \
+                else n_frames * steps_per_frame
+            if n_steps % record_every != 0:
+                raise ValueError(
+                    "n_steps={} is not divisible by record_every={} ({} steps "
+                    "would be left over). Nearby divisors of n_steps: {}.".format(
+                        n_steps, record_every, n_steps % record_every,
+                        sorted(d for d in range(1, n_steps + 1)
+                               if n_steps % d == 0
+                               and 0.4 * record_every <= d <= 2.5 * record_every)
+                        or "none close"))
+            n_records = n_steps // record_every
+        elif n_steps is not None:
+            raise ValueError("n_steps is only meaningful together with record_every")
+        else:
+            n_steps = n_frames * steps_per_frame
+            n_records = n_frames
+
         # Device-side cost per simulation: the movie in, the trajectory out.
-        bytes_per_sim = 2 * n_frames * nneurons * 4
+        bytes_per_sim = (n_frames + n_records) * nneurons * 4
         if batch_size is None:
             budget = int(memory_budget_gb * 1e9)
             bs = max(1, min(nsim_total, budget // max(bytes_per_sim, 1)))
@@ -427,9 +506,11 @@ class BrainNetwork:
 
         if verbose:
             print("movie: {} sims x {} frames x {} steps/frame = {} steps total; "
-                  "batch_size={} ({:.2f} GB on device per batch)".format(
-                      nsim_total, n_frames, steps_per_frame,
-                      n_frames * steps_per_frame, bs, bs * bytes_per_sim / 1e9))
+                  "{} records (every {} steps); batch_size={} "
+                  "({:.2f} GB on device per batch)".format(
+                      nsim_total, n_frames, steps_per_frame, n_steps,
+                      n_records, record_every if strided else steps_per_frame,
+                      bs, bs * bytes_per_sim / 1e9))
             sys.stdout.flush()
 
         movie_f = inputs_movie.astype(self.data_type_np)
@@ -442,7 +523,7 @@ class BrainNetwork:
                     "start must have shape ({0},) or ({1}, {0}), got {2}".format(
                         nneurons, nsim_total, start.shape))
 
-        activity = np.empty((nsim_total, n_frames, nneurons), dtype=out_dtype)
+        activity = np.empty((nsim_total, n_records, nneurons), dtype=out_dtype)
 
         for b0 in tqdm(range(0, nsim_total, bs)):
             b1 = min(b0 + bs, nsim_total)
@@ -453,7 +534,11 @@ class BrainNetwork:
                 x0 = tf.zeros((b1 - b0, nneurons), dtype=self.data_type_np)
             else:
                 x0 = tf.constant(np.ascontiguousarray(start[b0:b1]))
-            traj = self._advance_movie(batch_movie, x0, steps_per_frame)
+            if strided:
+                traj = self._advance_movie_strided(
+                    batch_movie, x0, steps_per_frame, record_every, n_steps)
+            else:
+                traj = self._advance_movie(batch_movie, x0, steps_per_frame)
             activity[b0:b1] = np.transpose(traj.numpy(), (1, 0, 2)).astype(out_dtype)
 
         return activity

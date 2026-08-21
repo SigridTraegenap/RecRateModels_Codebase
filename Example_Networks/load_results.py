@@ -27,10 +27,10 @@ from tools_2D.simulate.global_params import global_path
 # CONFIGURATION — set these to match the run you want to inspect
 # =============================================================================
 
-Save_key    = 'loop_reload_25-12-12_N60_linear'   # must match Save_key used when running
-folder_index = 0    # integer group index written by gimme_index (0, 1, 2, …)
+Save_key    = 'loop_reload_25-12-12_N60_linear_batched'   # must match Save_key used when running
+folder_index = 5    # integer group index written by gimme_index (0, 1, 2, …)
 
-N, M = 60, 60      # grid size (must match the run)
+
 
 # =============================================================================
 # LOAD ACTIVITY
@@ -45,7 +45,7 @@ with h5py.File(activity_file, 'r') as f:
 
 # Saved shape: (n_trials, n_stim, n_timepoints, n_pop, N, M)
 print('Activity shape:', activity.shape)
-n_trials, n_stim, n_tp, n_pop, _, _ = activity.shape
+n_trials, n_stim, n_tp, n_pop, N, M = activity.shape
 
 # =============================================================================
 # LOAD NETWORK PARAMETERS
